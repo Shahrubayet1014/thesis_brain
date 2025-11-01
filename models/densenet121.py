@@ -9,7 +9,7 @@ class DenseNet121Medical(nn.Module):
     If in_ch==3 and pretrained=True, we keep the default conv0.
     If in_ch!=3, we replace conv0 and (if pretrained) initialize by channel-averaging.
     """
-    def __init__(self, num_classes: int = 3, in_ch: int = 3, pretrained: bool = True, dropout_rate: float = 0.5):
+    def __init__(self, num_classes: int = 3, in_ch: int = 1, pretrained: bool = True, dropout_rate: float = 0.5):
         super().__init__()
         if pretrained:
             self.densenet = models.densenet121(weights=models.DenseNet121_Weights.IMAGENET1K_V1)

@@ -1,184 +1,209 @@
-"""
-train.py
-
-Simple training script for the brain tumor image dataset located at
-Dataset/Brain with subfolders: Glioma_tumor, Meningioma_tumor, No_tumor, Pituitary_tumor
-
-Usage (PowerShell):
-  python train.py --dataset Dataset/Brain --epochs 10 --batch_size 16
-
-The script uses TensorFlow Keras and transfer learning (EfficientNetB0).
-"""
-import argparse
-import json
+# main.py
 import os
-from pathlib import Path
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 
+import argparse
+import sys
+import json
+import random
+import re
 import numpy as np
-import tensorflow as tf
-from sklearn.metrics import classification_report, confusion_matrix
+import torch
+from torch.utils.data import DataLoader
+from sklearn.model_selection import train_test_split
 
-from models.model_engine import get_model
-from models.augmentations import get_augmentation_pipeline, mixup_batch
+# --- Robust imports (root or utils/) ---
+try:
+    from utils.dataloder import CTScanDataset
+except ModuleNotFoundError:
+    from utils.dataloder import CTScanDataset  # noqa
+
+try:
+    from utils.augmentation import get_augmentation
+except ModuleNotFoundError:
+    from utils.augmentation import get_augmentation  # noqa
+
+try:
+    from utils.evaluation import ModelTrainer
+except ModuleNotFoundError:
+    from utils.evaluation import ModelTrainer  # noqa
+
+try:
+    from models.modelengine import get_model
+except ModuleNotFoundError:
+    from models.modelengine import get_model  # noqa
 
 
-def main(args):
-    dataset_dir = Path(args.dataset)
-    if not dataset_dir.exists():
-        raise SystemExit(f"Dataset directory not found: {dataset_dir}")
+def parse_args():
+    p = argparse.ArgumentParser(description="Retinal/CT Disease Classification CLI (RGB/Gray)")
+    p.add_argument('--data_path', type=str, required=True, help='Root folder with class subfolders')
+    p.add_argument('--model', type=str, default='densenet121',
+                   choices=['customcnn', 'mobilenetv3', 'densenet121'])
+    p.add_argument('--epochs', type=int, default=40)
+    p.add_argument('--batch_size', type=int, default=16)
+    p.add_argument('--lr', type=float, default=1e-4)
+    p.add_argument('--weight_decay', type=float, default=1e-4)
+    p.add_argument('--optimizer', type=str, default='adamw', choices=['adamw', 'adam', 'sgd'])
+    p.add_argument('--scheduler', type=str, default='plateau', choices=['plateau', 'cosine', 'step'])
+    p.add_argument('--aug_type', type=str, default='mild', choices=['none', 'mild', 'strong', 'advanced'])
+    p.add_argument('--img_size', type=int, default=224)
+    p.add_argument('--color_mode', type=str, default='rgb', choices=['rgb', 'gray'],
+                   help='Input color mode; use gray for single-channel inputs')
+    p.add_argument('--pretrained', action='store_true')
+    p.add_argument('--num_workers', type=int, default=2)
+    p.add_argument('--save_dir', type=str, default='checkpoints')
+    p.add_argument('--log_dir', type=str, default='logs')
+    p.add_argument('--seed', type=int, default=42)
+    p.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
+    return p.parse_args()
 
-    image_size = args.image_size
-    batch_size = args.batch_size
 
-    print("Loading datasets from:", dataset_dir)
-    # Load and convert to grayscale
-    train_ds = tf.keras.preprocessing.image_dataset_from_directory(
-        dataset_dir,
-        labels="inferred",
-        label_mode="int",
-        validation_split=0.2,
-        subset="training",
-        seed=123,
-        image_size=(image_size, image_size),
-        batch_size=batch_size,
-        color_mode="grayscale",  # Load as grayscale
-    )
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-    val_ds = tf.keras.preprocessing.image_dataset_from_directory(
-        dataset_dir,
-        labels="inferred",
-        label_mode="int",
-        validation_split=0.2,
-        subset="validation",
-        seed=123,
-        image_size=(image_size, image_size),
-        batch_size=batch_size,
-        color_mode="grayscale",  # Load as grayscale
-    )
 
-    class_names = train_ds.class_names
+def stratified_split_indices(labels, train_ratio=0.8, val_ratio=0.1, seed=42):
+    idx = np.arange(len(labels))
+    y = np.array(labels)
+    from sklearn.model_selection import train_test_split
+    train_idx, temp_idx = train_test_split(idx, train_size=train_ratio, stratify=y, random_state=seed)
+    val_size = val_ratio / (1 - train_ratio)
+    val_idx, test_idx = train_test_split(temp_idx, train_size=val_size, stratify=y[temp_idx], random_state=seed)
+    return train_idx.tolist(), val_idx.tolist(), test_idx.tolist()
+
+
+def subset_dataset(dataset: CTScanDataset, indices, transform):
+    ds = CTScanDataset(dataset.data_dir, transform=transform, subset='train', color_mode=dataset.color_mode)
+    ds.class_to_idx = dataset.class_to_idx
+    ds.idx_to_class = dataset.idx_to_class
+    ds.samples = [dataset.samples[i] for i in indices]
+    return ds
+
+
+def main():
+    args = parse_args()
+    set_seed(args.seed)
+
+    # ---------- Result/<model_name>_<aug_type>/ ----------
+    run_name = f"{args.model}_{args.aug_type}".lower()
+    # sanitize to be file-system friendly
+    run_name = re.sub(r'[^a-z0-9_.-]+', '-', run_name)
+
+    result_root = os.path.join("Result", run_name)
+    os.makedirs(result_root, exist_ok=True)
+    args.save_dir = os.path.join(result_root, "checkpoints")
+    args.log_dir = os.path.join(result_root, "logs")
+    os.makedirs(args.save_dir, exist_ok=True)
+    os.makedirs(args.log_dir, exist_ok=True)
+
+    # Save config early
+    with open(os.path.join(result_root, "config.json"), "w") as f:
+        json.dump(vars(args), f, indent=2, sort_keys=True)
+    # -----------------------------------------------------
+
+    if not os.path.isdir(args.data_path):
+        print(f"❌ data_path not found: {args.data_path}")
+        sys.exit(1)
+
+    in_channels = 3 if args.color_mode.lower() == 'rgb' else 1
+
+    print("=" * 70)
+    print(f"Device: {args.device}")
+    print(f"Data: {args.data_path}")
+    print(f"Model: {args.model}")
+    print(f"Augmentation: {args.aug_type}")
+    print(f"Image size: {args.img_size}")
+    print(f"Color mode: {args.color_mode} ({in_channels} ch)")
+    print(f"Epochs: {args.epochs} | Batch: {args.batch_size}")
+    print(f"LR: {args.lr} | Weight Decay: {args.weight_decay}")
+    print(f"Optimizer: {args.optimizer} | Scheduler: {args.scheduler}")
+    print(f"Pretrained: {args.pretrained}")
+    print(f"Artifacts root: {result_root}")
+    print("=" * 70)
+
+    # Transforms (channel-aware normalization)
+    train_tf = get_augmentation(args.aug_type, args.img_size, in_channels=in_channels)
+    eval_tf = get_augmentation("none", args.img_size, in_channels=in_channels)
+
+    # Read full dataset
+    full_ds = CTScanDataset(data_dir=args.data_path, transform=None, subset='full', color_mode=args.color_mode)
+    labels = [lbl for _, lbl in full_ds.samples]
+    class_names = [name for name, _ in sorted(full_ds.class_to_idx.items(), key=lambda x: x[1])]
     num_classes = len(class_names)
-    print("Classes:", class_names)
+    print(f"Detected classes ({num_classes}): {class_names}")
 
-    AUTOTUNE = tf.data.AUTOTUNE
+    # Stratified split
+    train_idx, val_idx, test_idx = stratified_split_indices(labels, 0.8, 0.1, args.seed)
 
-    # Build augmentation pipeline based on CLI flags
-    aug_choices = args.augment or []
-    data_augmentation = get_augmentation_pipeline(aug_choices, image_size=image_size)
+    # Final datasets
+    train_ds = subset_dataset(full_ds, train_idx, train_tf)
+    val_ds = subset_dataset(full_ds, val_idx, eval_tf)
+    test_ds = subset_dataset(full_ds, test_idx, eval_tf)
 
-    def apply_augment(x, y):
-        return data_augmentation(x, training=True), y
+    # Loaders
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
+                              num_workers=args.num_workers, drop_last=True, pin_memory=False)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
+                            num_workers=args.num_workers, pin_memory=False)
+    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
+                             num_workers=args.num_workers, pin_memory=False)
 
-    train_ds = train_ds.map(lambda x, y: apply_augment(x, y))
-    train_ds = train_ds.prefetch(buffer_size=AUTOTUNE)
-    val_ds = val_ds.prefetch(buffer_size=AUTOTUNE)
+    # Model (channel-aware)
+    model = get_model(args.model, num_classes=num_classes, in_channels=in_channels, pretrained=args.pretrained)
+    model.to(args.device)
 
-    # If using mixup, convert labels to one-hot and apply mixup during training
-    use_mixup = "mixup" in (args.augment or [])
-    if use_mixup:
-        # convert labels to one-hot
-        num_classes = len(class_names)
-        def one_hot_map(x, y):
-            y = tf.one_hot(y, num_classes)
-            return x, y
+    # Class weights (inverse frequency)
+    class_counts = np.bincount(labels, minlength=num_classes).astype(float)
+    weights = (len(labels) / (num_classes * np.clip(class_counts, 1, None))).astype(np.float32)
+    class_weights = torch.tensor(weights, device=args.device)
 
-        train_ds = train_ds.map(one_hot_map)
-        val_ds = val_ds.map(lambda x, y: (x, tf.one_hot(y, num_classes)))
-
-    # build selected model from models package
-    model = get_model(name=args.model, num_classes=num_classes, image_size=image_size, dropout_rate=0.4, pretrained=True)
-
-    # if mixup used, use categorical loss and expect one-hot labels
-    if use_mixup:
-        loss = tf.keras.losses.CategoricalCrossentropy()
-    else:
-        loss = tf.keras.losses.SparseCategoricalCrossentropy()
-
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
-        loss=loss,
-        metrics=["accuracy"],
+    # Trainer
+    trainer = ModelTrainer(
+        model=model,
+        device=torch.device(args.device),
+        save_dir=args.save_dir,
+        log_dir=args.log_dir,
+        class_names=class_names
     )
 
-    out_dir = Path("saved_models")
-    out_dir.mkdir(exist_ok=True)
-
-    checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(
-        filepath=out_dir / "best_model.h5", monitor="val_accuracy", save_best_only=True
+    # Train
+    trainer.train(
+        train_loader=train_loader,
+        val_loader=val_loader,
+        num_epochs=args.epochs,
+        learning_rate=args.lr,
+        weight_decay=args.weight_decay,
+        class_weights=class_weights,
+        optimizer_name=args.optimizer,
+        scheduler_name=args.scheduler,
+        use_scheduler=True,
+        patience=10
     )
-    earlystop_cb = tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=6, restore_best_weights=True)
-    reduce_cb = tf.keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=3)
 
-    # If mixup, we need to apply mixing on the batches before passing to model.fit
-    if use_mixup:
-        # wrapper generator to apply mixup on the fly
-        def mixup_map(x, y):
-            mixed_x, mixed_y = mixup_batch(x, y, alpha=args.mixup_alpha)
-            return mixed_x, mixed_y
+    # Test
+    print("Evaluating on test set…")
+    results = trainer.evaluate(test_loader)
+    print("Final Test Metrics:")
+    for k, v in results.items():
+        if isinstance(v, (float, int)):
+            print(f"  {k}: {v:.4f}")
+        else:
+            print(f"  {k}: {v}")
 
-        train_ds_mix = train_ds.map(lambda x, y: tf.py_function(lambda a, b: mixup_batch(a, b, args.mixup_alpha), [x, y], Tout=[tf.float32, tf.float32]))
-        # Note: tf.py_function drops shape information; provide without shapes for now
-        history = model.fit(
-            train_ds_mix,
-            validation_data=val_ds,
-            epochs=args.epochs,
-            callbacks=[checkpoint_cb, earlystop_cb, reduce_cb],
-        )
-    else:
-        history = model.fit(
-            train_ds,
-            validation_data=val_ds,
-            epochs=args.epochs,
-            callbacks=[checkpoint_cb, earlystop_cb, reduce_cb],
-        )
+    # Persist final metrics
+    with open(os.path.join(result_root, "test_metrics.json"), "w") as f:
+        json.dump(results, f, indent=2, sort_keys=True)
 
-    # Save final model and history
-    model.save(out_dir / "final_model")
-    with open(out_dir / "history.json", "w", encoding="utf-8") as f:
-        json.dump(history.history, f, indent=2)
-
-    # Evaluation: predict on validation set and print a classification report
-    y_true = []
-    y_pred = []
-    for images, labels in val_ds:
-        probs = model.predict(images)
-        preds = np.argmax(probs, axis=-1)
-        y_true.extend(labels.numpy().tolist())
-        y_pred.extend(preds.tolist())
-
-    print("\nClassification report on validation set:")
-    print(classification_report(y_true, y_pred, target_names=class_names))
-    print("Confusion matrix:")
-    print(confusion_matrix(y_true, y_pred))
-
-    # Save reports
-    rep = classification_report(y_true, y_pred, target_names=class_names, output_dict=True)
-    with open(out_dir / "classification_report.json", "w", encoding="utf-8") as f:
-        json.dump(rep, f, indent=2)
+    print(f"\n✅ Artifacts saved under: {result_root}")
+    print(f"   - Checkpoints : {args.save_dir}")
+    print(f"   - Logs        : {args.log_dir}")
+    print(f"   - Config      : {os.path.join(result_root, 'config.json')}")
+    print(f"   - Test metrics: {os.path.join(result_root, 'test_metrics.json')}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", type=str, default="Dataset/Brain", help="Path to dataset directory")
-    parser.add_argument("--epochs", type=int, default=15)
-    parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--image_size", type=int, default=224)
-    parser.add_argument(
-        "--model",
-        type=str,
-        default="efficientnet",
-        choices=["efficientnet", "customcnn", "mobilenetv3", "resnet"],
-        help="Model architecture to use (default: efficientnet)",
-    )
-    parser.add_argument(
-        "--augment",
-        type=str,
-        nargs="*",
-        default=None,
-        choices=["basic", "color", "geometric", "cutout", "mixup"],
-        help="List of augmentations to apply. Use 'mixup' for mixup training. Example: --augment basic color",
-    )
-    parser.add_argument("--mixup_alpha", type=float, default=0.2, help="Alpha parameter for mixup Beta distribution")
-    parser.add_argument("--cutout_size", type=int, default=32, help="Cutout mask size (pixels) if cutout used")
-    args = parser.parse_args()
-    main(args)
+    main()
