@@ -18,23 +18,8 @@ import numpy as np
 import tensorflow as tf
 from sklearn.metrics import classification_report, confusion_matrix
 
-
-def build_model(num_classes: int, image_size: int, dropout_rate: float = 0.4):
-    base = tf.keras.applications.EfficientNetB0(
-        include_top=False, weights="imagenet", input_shape=(image_size, image_size, 3)
-    )
-    base.trainable = False
-
-    inputs = tf.keras.Input(shape=(image_size, image_size, 3))
-    x = tf.keras.applications.efficientnet.preprocess_input(inputs)
-
-    x = base(x, training=False)
-    x = tf.keras.layers.GlobalAveragePooling2D()(x)
-    x = tf.keras.layers.Dropout(dropout_rate)(x)
-    outputs = tf.keras.layers.Dense(num_classes, activation="softmax")(x)
-
-    model = tf.keras.Model(inputs, outputs)
-    return model
+from models.model_engine import get_model
+from models.augmentations import get_augmentation_pipeline, mixup_batch
 
 
 def main(args):
@@ -46,6 +31,7 @@ def main(args):
     batch_size = args.batch_size
 
     print("Loading datasets from:", dataset_dir)
+    # Load and convert to grayscale
     train_ds = tf.keras.preprocessing.image_dataset_from_directory(
         dataset_dir,
         labels="inferred",
@@ -55,6 +41,7 @@ def main(args):
         seed=123,
         image_size=(image_size, image_size),
         batch_size=batch_size,
+        color_mode="grayscale",  # Load as grayscale
     )
 
     val_ds = tf.keras.preprocessing.image_dataset_from_directory(
@@ -66,6 +53,7 @@ def main(args):
         seed=123,
         image_size=(image_size, image_size),
         batch_size=batch_size,
+        color_mode="grayscale",  # Load as grayscale
     )
 
     class_names = train_ds.class_names
@@ -74,23 +62,41 @@ def main(args):
 
     AUTOTUNE = tf.data.AUTOTUNE
 
-    # Basic augmentation
-    data_augmentation = tf.keras.Sequential(
-        [
-            tf.keras.layers.RandomFlip("horizontal"),
-            tf.keras.layers.RandomRotation(0.08),
-            tf.keras.layers.RandomZoom(0.06),
-        ]
-    )
+    # Build augmentation pipeline based on CLI flags
+    aug_choices = args.augment or []
+    data_augmentation = get_augmentation_pipeline(aug_choices, image_size=image_size)
 
-    train_ds = train_ds.map(lambda x, y: (data_augmentation(x, training=True), y))
+    def apply_augment(x, y):
+        return data_augmentation(x, training=True), y
+
+    train_ds = train_ds.map(lambda x, y: apply_augment(x, y))
     train_ds = train_ds.prefetch(buffer_size=AUTOTUNE)
     val_ds = val_ds.prefetch(buffer_size=AUTOTUNE)
 
-    model = build_model(num_classes=num_classes, image_size=image_size)
+    # If using mixup, convert labels to one-hot and apply mixup during training
+    use_mixup = "mixup" in (args.augment or [])
+    if use_mixup:
+        # convert labels to one-hot
+        num_classes = len(class_names)
+        def one_hot_map(x, y):
+            y = tf.one_hot(y, num_classes)
+            return x, y
+
+        train_ds = train_ds.map(one_hot_map)
+        val_ds = val_ds.map(lambda x, y: (x, tf.one_hot(y, num_classes)))
+
+    # build selected model from models package
+    model = get_model(name=args.model, num_classes=num_classes, image_size=image_size, dropout_rate=0.4, pretrained=True)
+
+    # if mixup used, use categorical loss and expect one-hot labels
+    if use_mixup:
+        loss = tf.keras.losses.CategoricalCrossentropy()
+    else:
+        loss = tf.keras.losses.SparseCategoricalCrossentropy()
+
     model.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
-        loss=tf.keras.losses.SparseCategoricalCrossentropy(),
+        loss=loss,
         metrics=["accuracy"],
     )
 
@@ -103,12 +109,28 @@ def main(args):
     earlystop_cb = tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=6, restore_best_weights=True)
     reduce_cb = tf.keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=3)
 
-    history = model.fit(
-        train_ds,
-        validation_data=val_ds,
-        epochs=args.epochs,
-        callbacks=[checkpoint_cb, earlystop_cb, reduce_cb],
-    )
+    # If mixup, we need to apply mixing on the batches before passing to model.fit
+    if use_mixup:
+        # wrapper generator to apply mixup on the fly
+        def mixup_map(x, y):
+            mixed_x, mixed_y = mixup_batch(x, y, alpha=args.mixup_alpha)
+            return mixed_x, mixed_y
+
+        train_ds_mix = train_ds.map(lambda x, y: tf.py_function(lambda a, b: mixup_batch(a, b, args.mixup_alpha), [x, y], Tout=[tf.float32, tf.float32]))
+        # Note: tf.py_function drops shape information; provide without shapes for now
+        history = model.fit(
+            train_ds_mix,
+            validation_data=val_ds,
+            epochs=args.epochs,
+            callbacks=[checkpoint_cb, earlystop_cb, reduce_cb],
+        )
+    else:
+        history = model.fit(
+            train_ds,
+            validation_data=val_ds,
+            epochs=args.epochs,
+            callbacks=[checkpoint_cb, earlystop_cb, reduce_cb],
+        )
 
     # Save final model and history
     model.save(out_dir / "final_model")
@@ -141,5 +163,22 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--image_size", type=int, default=224)
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="efficientnet",
+        choices=["efficientnet", "customcnn", "mobilenetv3", "resnet"],
+        help="Model architecture to use (default: efficientnet)",
+    )
+    parser.add_argument(
+        "--augment",
+        type=str,
+        nargs="*",
+        default=None,
+        choices=["basic", "color", "geometric", "cutout", "mixup"],
+        help="List of augmentations to apply. Use 'mixup' for mixup training. Example: --augment basic color",
+    )
+    parser.add_argument("--mixup_alpha", type=float, default=0.2, help="Alpha parameter for mixup Beta distribution")
+    parser.add_argument("--cutout_size", type=int, default=32, help="Cutout mask size (pixels) if cutout used")
     args = parser.parse_args()
     main(args)
