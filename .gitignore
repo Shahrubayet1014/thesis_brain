@@ -2,7 +2,7 @@
 venv/
 __pycache__/
 *.pyc
-requirements.txt
+
 saved_models/
 __init__.py
 Result/

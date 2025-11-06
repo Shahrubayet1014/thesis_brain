@@ -1,0 +1,15 @@
+pandas
+seaborn
+matplotlib
+numpy
+scikit-learn
+tensorflow
+keras
+torch
+opencv-python
+albumentations 
+tqdm
+tensorboard 
+torchvision
+efficientnet-pytorch
+torchaudio
